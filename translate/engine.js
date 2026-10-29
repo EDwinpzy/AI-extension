@@ -1247,15 +1247,14 @@ async function handleTestModel(request) {
 async function handleListModels(request) {
   const base = String((request && request.baseUrl) || '').replace(/\/+$/, '');
   if (!base) return { ok: false, error: '缺少服务地址' };
-  const headers = {};
-  if (request.apiKey) headers.Authorization = 'Bearer ' + request.apiKey;
-  Object.assign(headers, (await openCodeSessionHeaders(base)) || {});
-
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15000);
   try {
+    const headers = {};
+    if (request.apiKey) headers.Authorization = 'Bearer ' + request.apiKey;
+    Object.assign(headers, (await openCodeSessionHeaders(base)) || {});
+
     const response = await fetch(base + '/models', { headers, signal: controller.signal });
-    clearTimeout(timer);
     if (!response.ok) {
       return { ok: false, error: '服务返回 ' + response.status + '，检查服务是否在运行' };
     }
@@ -1274,9 +1273,12 @@ async function handleListModels(request) {
       ok: false,
       error: '无法连接：' + String((error && error.message) || error) + '。检查服务地址是否正确、服务是否在运行。',
     };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
+self.__engineBeforeListener = true;
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== 'object') return false;
 
@@ -1289,7 +1291,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === 'translate:list-models') {
-    handleListModels(message).then(sendResponse);
+    handleListModels(message).then(
+      sendResponse,
+      (error) => sendResponse({ ok: false, error: String((error && error.message) || error) })
+    );
     return true;
   }
   if (message.type === 'translate:get-settings') {
@@ -1318,6 +1323,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   return false;
 });
+self.__engineListenerRegistered = true;
 
 /* ----------------------------------------------------------- context menu */
 

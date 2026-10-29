@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AI-extension",
   "description": "ChatGPT 补丁的设置页：翻译、字幕、暗黑模式等设置，独立插件。",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "default_locale": "zh_CN",
   "background": {
     "service_worker": "background-loader.js"
@@ -31,6 +31,14 @@
   "host_permissions": [
     "<all_urls>"
   ],
+  "commands": {
+    "toggle-darkling": {
+      "suggested_key": {
+        "default": "Alt+Shift+D"
+      },
+      "description": "切换当前页面的暗黑模式"
+    }
+  },
   "icons": {
     "16": "images/icon16.png",
     "32": "images/icon32.png",

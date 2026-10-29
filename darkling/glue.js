@@ -190,6 +190,13 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   }
 });
 
-chrome.commands.onCommand.addListener((command) => {
-  if (command === 'toggle-darkling') darklingToggle();
-});
+/*
+ * chrome.commands only exists when the manifest declares a "commands" entry.
+ * Reading it unguarded threw at import time, which took the whole service
+ * worker down: every later message hung instead of failing.
+ */
+if (chrome.commands && chrome.commands.onCommand) {
+  chrome.commands.onCommand.addListener((command) => {
+    if (command === 'toggle-darkling') darklingToggle();
+  });
+}
