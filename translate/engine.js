@@ -1420,14 +1420,22 @@ const SUMMARY_PANEL_WAIT_MS = 25000;
  */
 async function pageScriptReady(tabId) {
   const ping = await chrome.tabs.sendMessage(tabId, { type: 'translate:ping' }).catch(() => null);
-  if (ping && ping.ok) return true;
+  if (ping && ping.ok) return { ok: true };
   try {
-    await chrome.scripting.executeScript({ target: { tabId }, files: ['translate/summary.js'] });
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      /* Both halves, because a tab that was open when the extension reloaded
+       * has neither, and the menu cannot know which feature was asked for. */
+      files: ['translate/content.js', 'translate/summary.js'],
+    });
   } catch (error) {
-    return false;
+    /* The reason is carried out of here: it is the only thing that turns
+     * "no reaction" into something the user can act on. */
+    return { ok: false, error: String((error && error.message) || error) };
   }
   const again = await chrome.tabs.sendMessage(tabId, { type: 'translate:ping' }).catch(() => null);
-  return Boolean(again && again.ok);
+  if (again && again.ok) return { ok: true };
+  return { ok: false, error: '脚本注入成功，但页面没有应答' };
 }
 
 /* The page then summarises by itself, and is told why it had to - that line is
@@ -1449,27 +1457,72 @@ function sidePanelAvailable() {
 }
 
 /*
- * A page that cannot be scripted - a browser page, the PDF viewer, the web
- * store - used to fail here in silence: the menu closed and nothing happened.
- * A notification is the only surface left once injection is refused.
+ * Why the injection was refused, in words that point at a fix. The raw
+ * message stays on the end: "cannot access contents of the page" and "the
+ * extensions gallery cannot be scripted" mean different things, and the
+ * difference is what decides whether this is a bug or a browser rule.
  */
-function notifySummaryUnavailable() {
+function injectionFailureReason(tab, error) {
+  const url = String((tab && tab.url) || '');
+  let host = url;
+  try { host = new URL(url).host || url; } catch (parseError) { /* keep the raw url */ }
+  if (/^(edge|chrome|about|devtools|view-source):/i.test(url)) {
+    return '浏览器内置页面不允许任何扩展注入脚本，换一个普通网页再试。';
+  }
+  if (/^chrome-extension:/i.test(url)) {
+    return '扩展自己的页面不允许注入脚本，换一个普通网页再试。';
+  }
+  if (/^file:/i.test(url)) {
+    return '本地文件需要先在扩展详情里打开「允许访问文件 URL」。';
+  }
+  if (/(chromewebstore\.google\.com|microsoftedge\.microsoft\.com\/addons)/i.test(url)) {
+    return '扩展商店页面不允许注入脚本。';
+  }
+  /*
+   * The permission exists on paper but the browser is withholding it. This is
+   * what "站点访问权限" set to 点击时 looks like from inside the extension, and
+   * it takes down translation and subtitles at the same time.
+   */
+  if (/cannot access contents|must request permission|cannot be scripted|Missing host permission/i.test(String(error || ''))) {
+    return '扩展没有这个页面的访问权限。打开 edge://extensions → 详情 → 站点访问权限，改成「在所有网站上」。';
+  }
+  return '注入脚本被拒绝（' + host + '）：' + String(error || '未知原因').slice(0, 90);
+}
+
+/*
+ * A page that cannot be scripted - a browser page, the PDF viewer, the web
+ * store - used to fail in silence: the menu closed and nothing happened. A
+ * notification is the only surface left once injection is refused, so it says
+ * which page, why, and what to change.
+ */
+function notifyPageUnavailable(tab, error, action) {
   try {
-    chrome.notifications.create('codex-summary-unavailable', {
+    chrome.notifications.create('codex-page-unavailable', {
       type: 'basic',
       iconUrl: chrome.runtime.getURL('images/icon128.png'),
-      title: '这个页面无法总结',
-      message: '浏览器内置页面、扩展页面和 PDF 阅读器不允许注入脚本，换一个普通网页再试。',
+      title: '这个页面无法' + (action || '操作'),
+      message: injectionFailureReason(tab, error),
     });
-  } catch (error) {
+  } catch (notificationError) {
     /* Best effort: the menu click must not throw either way. */
   }
 }
 
+/* Every menu action goes through here: inject first, explain if refused. */
+async function sendToPage(tab, message, action) {
+  const ready = await pageScriptReady(tab.id);
+  if (!ready.ok) {
+    notifyPageUnavailable(tab, ready.error, action);
+    return;
+  }
+  chrome.tabs.sendMessage(tab.id, message).catch(() => {});
+}
+
 async function summarizeIntoPanel(tab) {
   const tabId = tab.id;
-  if (!(await pageScriptReady(tabId))) {
-    notifySummaryUnavailable();
+  const ready = await pageScriptReady(tabId);
+  if (!ready.ok) {
+    notifyPageUnavailable(tab, ready.error, '总结');
     return;
   }
   if (!sidePanelAvailable()) {
@@ -1535,7 +1588,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === TRANSLATE_MENU.PAGE) {
     // One item, two directions: whatever the page is showing decides the label.
     const type = isPageTranslated(tab.id) ? 'translate:restore-page' : 'translate:translate-page';
-    chrome.tabs.sendMessage(tab.id, { type }).catch(() => {});
+    sendToPage(tab, { type }, '翻译');
     return;
   }
   if (info.menuItemId === TRANSLATE_MENU.SUMMARY) {
@@ -1543,8 +1596,6 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     return;
   }
   if (info.menuItemId === TRANSLATE_MENU.SELECTION) {
-    chrome.tabs
-      .sendMessage(tab.id, { type: 'translate:show-bubble', text: info.selectionText || '' })
-      .catch(() => {});
+    sendToPage(tab, { type: 'translate:show-bubble', text: info.selectionText || '' }, '翻译');
   }
 });
