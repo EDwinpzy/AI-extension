@@ -74,54 +74,65 @@ function scheduleMenuRefresh() {
   }, 120);
 }
 
-function installContextMenus() {
+function createMenu(props) {
+  chrome.contextMenus.create(props, () => void chrome.runtime.lastError);
+}
+
+/*
+ * force=false keeps existing items: a service worker can be woken for any
+ * event and then terminated, so an unconditional removeAll here would wipe the
+ * menu whenever the worker restarts. Only a real install clears the list.
+ */
+function installContextMenus(force) {
   if (menuInstalling) return;
   menuInstalling = true;
-  chrome.contextMenus.removeAll(() => {
+  const createAll = () => {
     menuInstalling = false;
-    chrome.contextMenus.create({
+    createMenu({
       id: CODEX_MENU.selection,
       title: '翻译选中文字',
       contexts: ['selection'],
-    }, () => void chrome.runtime.lastError);
-    chrome.contextMenus.create({
+    });
+    createMenu({
       id: CODEX_MENU.page,
       title: '翻译网页',
       contexts: ['page'],
-    }, () => void chrome.runtime.lastError);
-    chrome.contextMenus.create({
+    });
+    createMenu({
       id: CODEX_MENU.summary,
       title: '总结全文',
       contexts: ['page'],
-    }, () => void chrome.runtime.lastError);
-    chrome.contextMenus.create({
+    });
+    createMenu({
       id: CODEX_MENU.darkToggle,
       title: '切换暗黑模式',
       contexts: ['page'],
-    }, () => void chrome.runtime.lastError);
-    chrome.contextMenus.create({
+    });
+    createMenu({
       id: CODEX_MENU.darkBlacklist,
       title: '添加暗黑模式黑名单',
       contexts: ['page'],
-    }, () => void chrome.runtime.lastError);
-    chrome.contextMenus.create({
+    });
+    createMenu({
       id: CODEX_MENU.separator,
       type: 'separator',
       contexts: ['page'],
-    }, () => void chrome.runtime.lastError);
-    chrome.contextMenus.create({
+    });
+    createMenu({
       id: CODEX_MENU.darkPanel,
       title: '暗色模式设置…',
       contexts: ['page'],
-    }, () => void chrome.runtime.lastError);
-    chrome.contextMenus.create({
+    });
+    createMenu({
       id: CODEX_MENU.settings,
       title: '翻译设置',
       contexts: ['page', 'selection'],
-    }, () => void chrome.runtime.lastError);
+    });
 
     refreshContextMenus().catch(() => {});
-  });
+  };
+  if (force) chrome.contextMenus.removeAll(createAll);
+  else createAll();
 }
 
 /* ------------------------------------------------------------- dark mode */
@@ -159,9 +170,9 @@ function darklingOpenPanel(tab) {
 
 /* ----------------------------------------------------------------- wiring */
 
-installContextMenus();
-chrome.runtime.onInstalled.addListener(installContextMenus);
-chrome.runtime.onStartup.addListener(installContextMenus);
+installContextMenus(false);
+chrome.runtime.onInstalled.addListener(() => installContextMenus(true));
+chrome.runtime.onStartup.addListener(() => installContextMenus(false));
 
 chrome.tabs.onActivated.addListener(scheduleMenuRefresh);
 chrome.tabs.onUpdated.addListener((tabId, change) => {
