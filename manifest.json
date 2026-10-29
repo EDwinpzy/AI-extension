@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "AI-extension",
   "description": "ChatGPT 补丁的设置页：翻译、字幕、暗黑模式等设置，独立插件。",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "default_locale": "zh_CN",
   "background": {
     "service_worker": "background-loader.js"

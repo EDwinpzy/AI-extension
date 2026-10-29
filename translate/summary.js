@@ -13,7 +13,12 @@
 
 (() => {
   if (window.__codexSummaryLoaded) return;
-  window.__codexSummaryLoaded = true;
+  /*
+   * The flag is raised at the end, not here. Raising it first meant a setup
+   * that threw halfway left the page poisoned: the guard blocked every later
+   * injection, so the message listener never existed and the menu waited for
+   * an answer that could not come.
+   */
 
   const HOST_ID = 'codex-summary-page';
   const MAX_CHARS = 12000;
@@ -567,4 +572,7 @@
   /* Visible from the page's own world, next to the translation flag, so the
    * load can be confirmed without digging into isolated worlds. */
   document.documentElement.setAttribute('data-codex-summary', 'ready');
+  /* Only now is the page actually ready to answer: the listener above is what
+   * the menu pings for. */
+  window.__codexSummaryLoaded = true;
 })();
