@@ -1437,15 +1437,43 @@ function askPageToSummarize(tabId, note) {
 }
 
 /*
- * 总结全文: hand the article to the Codex side panel, which is where the chat
- * already lives. The panel opens for this tab, its own script finds the article
- * in storage and types it into the composer. If no panel takes it in time - the
- * local app server is not running, or the composer moved - the page falls back
- * to summarising by itself, so the menu never ends in silence.
+ * 总结全文: hand the article to a side panel when one exists - that is where
+ * the chat already lives, and its script finds the article in storage and
+ * types it into the composer. This build ships no side panel, so the hand-off
+ * is only attempted when the API is really there; otherwise the page would
+ * flash "handing over to the side panel" and fall straight back for nothing.
+ * Everything else summarises in the page, so the menu never ends in silence.
  */
+function sidePanelAvailable() {
+  return Boolean(chrome.sidePanel && typeof chrome.sidePanel.open === 'function');
+}
+
+/*
+ * A page that cannot be scripted - a browser page, the PDF viewer, the web
+ * store - used to fail here in silence: the menu closed and nothing happened.
+ * A notification is the only surface left once injection is refused.
+ */
+function notifySummaryUnavailable() {
+  try {
+    chrome.notifications.create('codex-summary-unavailable', {
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('images/icon128.png'),
+      title: '这个页面无法总结',
+      message: '浏览器内置页面、扩展页面和 PDF 阅读器不允许注入脚本，换一个普通网页再试。',
+    });
+  } catch (error) {
+    /* Best effort: the menu click must not throw either way. */
+  }
+}
+
 async function summarizeIntoPanel(tab) {
   const tabId = tab.id;
   if (!(await pageScriptReady(tabId))) {
+    notifySummaryUnavailable();
+    return;
+  }
+  if (!sidePanelAvailable()) {
+    askPageToSummarize(tabId);
     return;
   }
   /* Something on screen right away: the panel route can take seconds, and a
