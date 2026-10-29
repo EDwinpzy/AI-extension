@@ -7,3 +7,7 @@ importScripts(
   'darkling/js/background.js',
   'darkling/glue.js'
 );
+
+chrome.action.onClicked.addListener(() => {
+  chrome.runtime.openOptionsPage();
+});
