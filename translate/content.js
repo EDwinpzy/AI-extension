@@ -39,9 +39,9 @@
   let contentObserver = null;
   /* Every block translated on this page, so 还原原文 covers the late passes too. */
   let translatedUnits = [];
-  /* Text nodes inside a container that were translated on their own. A WeakSet:
-   * a text node cannot carry an attribute. */
-  let translatedRuns = new WeakSet();
+  /* Text nodes inside a container that were translated on their own, mapped
+   * to the value written. A text node cannot carry an attribute. */
+  let translatedRuns = new WeakMap();
 
   /* ------------------------------------------------------------- styling */
 
@@ -501,6 +501,17 @@
     return nodes;
   }
 
+  /* A no-mark unit records the exact value it wrote, so a page re-render that
+   * changes the node is translated again instead of being mistaken for ours. */
+  function runTranslated(node) {
+    return translatedRuns.get(node) === node.nodeValue;
+  }
+
+  function allTextRunsTranslated(element) {
+    const nodes = textNodesOf(element);
+    return nodes.length > 0 && nodes.every(runTranslated);
+  }
+
   function ensurePageHost() {
     if (pageHost && pageHost.isConnected) return;
     pageHost = document.createElement('div');
@@ -548,6 +559,87 @@
 
   function ownText(element) {
     return String(element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  /*
+   * The page's whitespace is part of its formatting. A text node can carry
+   * meaningful leading/trailing spaces, tabs and newlines (especially with
+   * white-space: pre-wrap), so replacing its contents must not trim them.
+   */
+  function leadingWhitespace(value) {
+    return String(value == null ? '' : value).match(/^\s*/)[0];
+  }
+
+  function trailingWhitespace(value) {
+    return String(value == null ? '' : value).match(/\s*$/)[0];
+  }
+
+  function whitespaceOnly(value) {
+    return String(value == null ? '' : value).replace(/[^\s]/g, '');
+  }
+
+  /*
+   * Keep the page's line count and indentation when a text node itself
+   * contains newlines (white-space: pre-wrap). The translation is split near
+   * the same character positions, preferring whitespace and punctuation, and
+   * the original separators are written back unchanged.
+   */
+  function splitTranslationLines(value, weights) {
+    const text = String(value == null ? '' : value).trim();
+    const count = weights.length;
+    if (count <= 1) return [text];
+    const lines = [];
+    let start = 0;
+    for (let index = 0; index < count - 1; index++) {
+      const remainingWeight = weights.slice(index).reduce((sum, weight) => sum + weight, 0) || (count - index);
+      const share = weights[index] / remainingWeight;
+      const target = start + Math.round((text.length - start) * share);
+      const radius = Math.max(2, Math.floor((text.length - start) * 0.18));
+      const min = Math.max(start, Math.min(text.length, target - radius));
+      const max = Math.max(min, Math.min(text.length, target + radius));
+      let cut = Math.min(Math.max(target, min), max);
+      let bestScore = Infinity;
+      for (let position = min; position <= max; position++) {
+        const before = text.charAt(position - 1);
+        const after = text.charAt(position);
+        let score = Math.abs(position - target);
+        if (/\s/.test(before) || /\s/.test(after)) score -= 4;
+        else if (/[，。！？；：、,.!?;:]/.test(before)) score -= 3;
+        if (score < bestScore) {
+          bestScore = score;
+          cut = position;
+        }
+      }
+      lines.push(text.slice(start, cut).trim());
+      start = cut;
+    }
+    lines.push(text.slice(start).trim());
+    return lines;
+  }
+
+  function withOriginalWhitespace(value, replacement) {
+    const text = String(value == null ? '' : value);
+    const leading = leadingWhitespace(text);
+    const trailing = trailingWhitespace(text);
+    const core = text.slice(leading.length, text.length - trailing.length);
+    if (!core) return leading + replacement;
+    if (!/[\r\n]/.test(core)) return leading + replacement + trailing;
+
+    const parts = core.split(/(\r?\n[^\S\r\n]*)/);
+    const lines = parts.filter((part, index) => index % 2 === 0);
+    const separators = parts.filter((part, index) => index % 2 === 1);
+    const weights = lines.map((line) => line.replace(/\s/g, '').length || 1);
+    const supplied = String(replacement == null ? '' : replacement).split(/\r?\n/).map((line) => line.trim());
+    const translated = supplied.length === lines.length ? supplied : splitTranslationLines(replacement, weights);
+    const rendered = lines.map((line, index) => {
+      if (!line.trim()) return line;
+      return leadingWhitespace(line) + (translated[index] || '') + trailingWhitespace(line);
+    });
+    let output = leading + rendered[0];
+    for (let index = 0; index < separators.length; index++) {
+      output += separators[index] + rendered[index + 1];
+    }
+    return output + trailing;
   }
 
   /*
@@ -600,6 +692,55 @@
   }
 
   /*
+   * A <br> is a real line break in the page's formatting. Translating the
+   * whole block as one unit puts the result in the first text run and leaves
+   * the following lines blank, so each line gets its own unit and its own
+   * translation. The <br> itself is never touched.
+   */
+  function lineUnitsOf(element, nodes) {
+    if (!nodes.length) return [];
+    const wanted = new Set(nodes);
+    const groups = [];
+    let current = [];
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (node.nodeType === 1 && node.tagName === 'BR') return NodeFilter.FILTER_ACCEPT;
+        if (node.nodeType === 3 && wanted.has(node)) return NodeFilter.FILTER_ACCEPT;
+        return NodeFilter.FILTER_SKIP;
+      },
+    });
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.nodeType === 1) {
+        if (current.length) groups.push(current);
+        current = [];
+      } else {
+        current.push(node);
+      }
+    }
+    if (current.length) groups.push(current);
+
+    return groups
+      .map((group) => {
+        if (group.every(runTranslated)) return null;
+        const text = group
+          .map((item) => item.nodeValue)
+          .join('')
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (text.length < 2) return null;
+        return {
+          element,
+          nodes: group,
+          original: group.map((item) => item.nodeValue),
+          text,
+          noMark: true,
+        };
+      })
+      .filter(Boolean);
+  }
+
+  /*
    * Innermost text blocks: a container that holds other blocks is not a unit.
    * Two kinds of text would fall through that rule - the container's own text
    * and the inline elements sitting next to its block children - so both are
@@ -648,8 +789,14 @@
         // get collected itself, carrying the translated children's text.
         blocks.push(node);
         if (hasVideo && insideCaptionLayer(node)) continue;
+        if (allTextRunsTranslated(node)) continue;
         if (staleMark(node)) continue;
-        candidates.push({ element: node, text });
+        if (node.querySelector('br')) {
+          const lineUnits = lineUnitsOf(node, textNodesOf(node));
+          if (lineUnits.length) candidates.push(...lineUnits);
+        } else {
+          candidates.push({ element: node, text });
+        }
       }
     }
 
@@ -678,7 +825,7 @@
         if (child.nodeType === 3) {
           // The container's own text, outside every block child. Scoped to this
           // one text node, so the children keep theirs.
-          if (translatedRuns.has(child)) continue;
+          if (runTranslated(child)) continue;
           const run = String(child.nodeValue || '').replace(/\s+/g, ' ').trim();
           if (run.length < 2) continue;
           units.push({
@@ -729,17 +876,30 @@
       node.nodeValue = slot.original[index];
     });
     if (mode === 'replace') {
-      // The translation lands in the first text run; the rest is blanked so a
-      // block split by inline markup does not leave stray original words.
-      nodes[0].nodeValue = translation;
-      for (let index = 1; index < nodes.length; index++) nodes[index].nodeValue = '';
+      /*
+       * The translation lands in the first text run, but the whitespace
+       * skeleton stays in place: leading/trailing whitespace on that run, and
+       * every whitespace character in the runs around it. This keeps spaces
+       * around inline markup and <br> line breaks exactly where the page put
+       * them instead of collapsing them into one line.
+       */
+      const firstOriginal = slot.original[0];
+      const singleRun = nodes.length === 1;
+      nodes[0].nodeValue = singleRun
+        ? withOriginalWhitespace(firstOriginal, translation)
+        : leadingWhitespace(firstOriginal) + translation;
+      for (let index = 1; index < nodes.length; index++) {
+        nodes[index].nodeValue = whitespaceOnly(slot.original[index]);
+      }
       return;
     }
     // Prefer a text run that belongs to the block itself, so the translation
     // does not end up inside a nested <b>/<code> with the wrong styling.
     const direct = nodes.filter((node) => node.parentElement === slot.element);
     const host = direct.length ? direct[direct.length - 1] : nodes[nodes.length - 1];
-    host.nodeValue = String(host.nodeValue).replace(/\s+$/, '') + ' ' + translation;
+    const existing = String(host.nodeValue);
+    const separator = /\s$/.test(existing) || /^\s/.test(String(translation)) ? '' : ' ';
+    host.nodeValue = existing + separator + translation;
   }
 
   function normalizeLabel(value) {
@@ -873,6 +1033,13 @@
     writeSlot(unit, translation, mode);
     for (const slot of twinSlots(unit)) writeSlot(slot, translation, mode);
     overridePseudoEcho(unit, mode === 'replace' ? translation : unit.text + ' ' + translation);
+  }
+
+  function rememberRuns(unit) {
+    if (!unit.noMark || !unit.nodes) return;
+    for (const slot of unit.twins ? [unit, ...unit.twins] : [unit]) {
+      for (const node of slot.nodes || []) translatedRuns.set(node, node.nodeValue);
+    }
   }
 
   /*
@@ -1058,6 +1225,7 @@
       const short = response.translations[index];
       if (!short || !short.trim() || short === job.unit.translation) return;
       paint(job.unit, short);
+      rememberRuns(job.unit);
       job.unit.translation = short;
     });
   }
@@ -1081,10 +1249,7 @@
     if (!unit.noMark) {
       unit.element.setAttribute(MARK, currentMode());
       unit.element.setAttribute(MARK_HASH, String(textHash(ownText(unit.element))));
-    } else if (unit.nodes && unit.nodes[0]) {
-      // Remember the text node itself, so the next pass leaves it alone.
-      translatedRuns.add(unit.nodes[0]);
-    }
+    } else rememberRuns(unit);
     translatedUnits.push(unit);
     if (translatedUnits.length > 4000) translatedUnits.splice(0, 1000);
     unit.translation = translation;
@@ -1131,7 +1296,7 @@
       }
     }
     translatedUnits = [];
-    translatedRuns = new WeakSet();
+    translatedRuns = new WeakMap();
     hideProgress();
     pageRun = null;
     reportPageState(false);

@@ -23,7 +23,7 @@ AI-extension 是一个可直接加载的 Manifest V3 浏览器扩展，把 AI �
 
 ### 功能
 
-- **AI 翻译**：支持划词翻译、整页翻译、自动翻译和原文/译文恢复；整页模式可选双语对照或仅显示译文。
+- **AI 翻译**：支持划词翻译、整页翻译、自动翻译和原文/译文恢复；整页模式可选双语对照或仅显示译文，并保留页面原有的空格、换行和 `<br>` 分行结构。
 - **灵活的模型路由**：支持 Ollama、LM Studio、llama.cpp 等本地服务，也支持 DeepSeek、Command Code、OpenCode Zen/Go 及任意兼容接口。模型可拖动排序，当前模型不可用时会按顺序自动回退。
 - **接口兼容**：云端模型可选择 Chat Completions、Anthropic Messages 或 OpenAI Responses 接口。
 - **术语表**：内置 AI、工程、金融和产品名词；支持自定义词条及 UTF-8 CSV 导入/导出。
@@ -141,7 +141,7 @@ images/                扩展图标
 运行测试：
 
 ```bash
-node --test bookmarks/tests/classifier.test.js bookmarks/tests/page-inspector.test.js bookmarks/tests/worker-automation.test.js bookmarks/tests/browser-port-recovery.test.js bookmarks/tests/browser-render.test.js darkling/tests/dark-mode-regression.test.js
+node --test --test-concurrency=1 bookmarks/tests/classifier.test.js bookmarks/tests/page-inspector.test.js bookmarks/tests/worker-automation.test.js bookmarks/tests/browser-port-recovery.test.js bookmarks/tests/browser-render.test.js darkling/tests/dark-mode-regression.test.js translate/tests/page-format.e2e.test.js
 ```
 
 其中浏览器渲染测试需要本机安装 Microsoft Edge；未安装时相关用例会自动跳过。设置页 UI 测试 `translate/tests/options.subtitle-model.e2e.test.mjs` 还需要单独安装 `jsdom`。
@@ -161,7 +161,7 @@ AI-extension is a directly loadable Manifest V3 browser extension that combines 
 
 ### Features
 
-- **AI translation**: Translate a selection or a whole page, auto-translate pages, and restore the original text. Whole-page mode supports bilingual comparison or translation-only display.
+- **AI translation**: Translate a selection or a whole page, auto-translate pages, and restore the original text. Whole-page mode supports bilingual comparison or translation-only display while preserving the page's original spacing, line breaks, and `<br>` structure.
 - **Flexible model routing**: Use local services such as Ollama, LM Studio, and llama.cpp, or cloud providers such as DeepSeek, Command Code, and OpenCode Zen/Go. Custom compatible endpoints are also supported. Models can be reordered and are tried in order when the active model fails.
 - **API dialects**: Cloud models can use Chat Completions, Anthropic Messages, or OpenAI Responses.
 - **Glossary**: Ships with AI, engineering, finance, and product terminology. Custom entries and UTF-8 CSV import/export are supported.
@@ -279,7 +279,7 @@ images/                Extension icons
 Run the tests:
 
 ```bash
-node --test bookmarks/tests/classifier.test.js bookmarks/tests/page-inspector.test.js bookmarks/tests/worker-automation.test.js bookmarks/tests/browser-port-recovery.test.js bookmarks/tests/browser-render.test.js darkling/tests/dark-mode-regression.test.js
+node --test --test-concurrency=1 bookmarks/tests/classifier.test.js bookmarks/tests/page-inspector.test.js bookmarks/tests/worker-automation.test.js bookmarks/tests/browser-port-recovery.test.js bookmarks/tests/browser-render.test.js darkling/tests/dark-mode-regression.test.js translate/tests/page-format.e2e.test.js
 ```
 
 The browser-rendering tests require Microsoft Edge and skip automatically when it is unavailable. The settings UI test at `translate/tests/options.subtitle-model.e2e.test.mjs` additionally requires `jsdom` to be installed separately.
