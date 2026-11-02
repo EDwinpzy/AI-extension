@@ -159,7 +159,7 @@
 
     <section class="view" id="view-bookmarks" hidden>
       <h1>书签整理</h1>
-      <p class="desc">按收藏栏的文件夹归类、清重复，动手前先给预览。</p>
+      <p class="desc">按收藏栏文件夹归类。分类前会用未激活标签页读取网页实际正文；读不到的网页不会强行归类。</p>
 
       <div class="bm-stats">
         <div class="bm-stat"><b id="bmBarCount">—</b><span>书签</span></div>
@@ -256,16 +256,8 @@
           <h3>自动</h3>
         </div>
         <div class="bm-line">
-          <div class="label"><b>新书签自动分类</b></div>
-          <button id="bmAutoClassify" class="switch" role="switch" aria-checked="false"><i></i></button>
-        </div>
-        <div class="bm-line">
-          <div class="label"><b>新书签自动精简名称</b><span>保存 2 秒后自动处理</span></div>
-          <button id="bmAutoRename" class="switch" role="switch" aria-checked="false"><i></i></button>
-        </div>
-        <div class="bm-line">
-          <div class="label"><b>定时去重</b></div>
-          <button id="bmAutoDedupe" class="switch" role="switch" aria-checked="false"><i></i></button>
+          <div class="label"><b>自动整理书签</b><span>新书签保存 2 秒后自动精简、归类；定时去重也由这里控制</span></div>
+          <button id="bmAutoAll" class="switch" role="switch" aria-checked="false"><i></i></button>
         </div>
         <div class="bm-line" id="bmIntervalRow" hidden>
           <div class="label"><b>扫描频率</b></div>

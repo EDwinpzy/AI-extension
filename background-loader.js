@@ -24,6 +24,7 @@ importScripts(
   'translate/engine.js',
   'bookmarks/lib/bookmark-utils.js',
   'bookmarks/lib/deduplicator.js',
+  'bookmarks/lib/page-inspector.js',
   'bookmarks/lib/classifier.js',
   'bookmarks/worker.js',
   'darkling/js/background.js',

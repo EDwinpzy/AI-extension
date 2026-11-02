@@ -18,27 +18,76 @@
   const DEDUPE_ALARM = 'codex-bookmarks-dedupe';
   const AUTO_BOOKMARK_DEBOUNCE_MS = 2000;
   const PORT_NAME = 'codex-bookmarks';
+  const KEEPALIVE_INTERVAL_MS = 20000;
 
   const DEFAULT_SETTINGS = {
-    // New bookmarks are only filed when this is switched on: it changes
-    // bookmarks on its own, so it is never on by default.
-    autoClassify: false,
-    // New bookmark titles are only rewritten when this is switched on.
-    autoRename: false,
-    // Same for the scheduled dedupe, and it deletes rather than moves.
-    autoDedupe: false,
+    // One switch owns every automatic bookmark action: rename, classify and
+    // scheduled dedupe. They change or delete data, so they stay off by default.
+    autoEnabled: false,
     autoDedupeInterval: 24,
     // Empty means "whatever the translation main model is".
     bookmarkModelId: '',
     moveClassified: true,
   };
 
+  const LEGACY_AUTOMATION_KEYS = ['autoClassify', 'autoRename', 'autoDedupe'];
+
   if (!NS) {
     console.error('[bookmarks] the ported libraries did not load; bookmark features are off');
     return;
   }
 
+  /*
+   * Organizing can spend longer than the service worker's idle allowance inside
+   * a page load or model request. A long-lived port no longer keeps MV3 workers
+   * alive on its own, so make a cheap extension-API call while a long bookmark
+   * job is active.
+   */
+  let keepAliveUsers = 0;
+  let keepAliveTimer = null;
+  function retainWorker() {
+    keepAliveUsers++;
+    if (keepAliveTimer) return;
+    const ping = () => {
+      try {
+        Promise.resolve(chrome.runtime.getPlatformInfo()).catch(() => {});
+      } catch (error) {}
+    };
+    ping();
+    keepAliveTimer = setInterval(ping, KEEPALIVE_INTERVAL_MS);
+  }
+  function releaseWorker() {
+    keepAliveUsers = Math.max(0, keepAliveUsers - 1);
+    if (keepAliveUsers || !keepAliveTimer) return;
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
+  async function withWorkerKeepAlive(task) {
+    retainWorker();
+    try {
+      return await task();
+    } finally {
+      releaseWorker();
+    }
+  }
+
   /* ------------------------------------------------------------- settings */
+
+  function normalizeSettings(stored) {
+    const source = stored && typeof stored === 'object' ? stored : {};
+    const hasMasterSwitch = Object.prototype.hasOwnProperty.call(source, 'autoEnabled');
+    // Preserve automation only when the old version had all three switches on.
+    // A partial legacy setup falls back to off instead of silently enabling new
+    // bookmark changes or scheduled deletion.
+    const legacyAutoEnabled = source.autoClassify === true &&
+      source.autoRename === true &&
+      source.autoDedupe === true;
+    const next = Object.assign({}, DEFAULT_SETTINGS, source, {
+      autoEnabled: hasMasterSwitch ? source.autoEnabled === true : legacyAutoEnabled,
+    });
+    for (const key of LEGACY_AUTOMATION_KEYS) delete next[key];
+    return next;
+  }
 
   async function readSettings() {
     let stored = null;
@@ -48,11 +97,11 @@
     } catch (error) {
       stored = null;
     }
-    return Object.assign({}, DEFAULT_SETTINGS, stored || {});
+    return normalizeSettings(stored);
   }
 
   async function writeSettings(patch) {
-    const next = Object.assign(await readSettings(), patch || {});
+    const next = normalizeSettings(Object.assign({}, await readSettings(), patch || {}));
     await chrome.storage.local.set({ [SETTINGS_KEY]: next });
     await scheduleDedupeAlarm(next);
     return next;
@@ -137,8 +186,8 @@
     const results = await NS.classifyBookmarks(
       candidates,
       { categories, model, disableThinking: model.disableThinking, instruction: customInstruction },
-      (done, total) => {
-        post(port, { progress: { done, total } });
+      (progress) => {
+        post(port, { progress });
       }
     );
 
@@ -226,7 +275,10 @@
         }
         if (plannedDuplicateRemoveIds.has(bookmark.id)) continue;
 
-        const category = resultById.get(bookmark.id) || ['工具'];
+        const category = resultById.get(bookmark.id);
+        // No model answer means no evidence. Leave the bookmark in place
+        // instead of silently filing it under the catch-all folder.
+        if (!category) continue;
         if (!settings.moveClassified && alreadyClassified(bookmark, category)) {
           skipped++;
           continue;
@@ -437,10 +489,13 @@
       if (!message || typeof message !== 'object') return;
       const id = message.id;
       Promise.resolve()
-        .then(() => handle(message, port))
-        .then((data) => port.postMessage({ id, ok: true, data }))
+        .then(() => {
+          const longRunning = message.type === 'organize-preview' || message.type === 'organize-apply';
+          return longRunning ? withWorkerKeepAlive(() => handle(message, port)) : handle(message, port);
+        })
+        .then((data) => post(port, { id, ok: true, data }))
         .catch((error) => {
-          port.postMessage({ id, ok: false, error: String((error && error.message) || error) });
+          post(port, { id, ok: false, error: String((error && error.message) || error) });
         });
     });
   });
@@ -468,7 +523,7 @@
 
     try {
       const settings = await readSettings();
-      if (!settings.autoRename) return;
+      if (!settings.autoEnabled) return;
 
       const found = await chrome.bookmarks.get(id).catch(() => null);
       const before = found && found[0];
@@ -490,7 +545,7 @@
       }
 
       const latestSettings = await readSettings();
-      if (!latestSettings.autoRename) {
+      if (!latestSettings.autoEnabled) {
         await note('off');
         return;
       }
@@ -535,7 +590,7 @@
 
     try {
       const settings = await readSettings();
-      if (!settings.autoClassify) {
+      if (!settings.autoEnabled) {
         await note('off');
         return;
       }
@@ -576,12 +631,11 @@
     if (previous) clearTimeout(previous);
     const timer = setTimeout(() => {
       pendingBookmarkCreate.delete(id);
-      autoRenameBookmark(id, bookmark)
-        .then(async () => {
-          const latest = await chrome.bookmarks.get(id).catch(() => null);
-          await autoClassify(id, latest && latest[0] ? latest[0] : bookmark);
-        })
-        .catch(() => {});
+      withWorkerKeepAlive(async () => {
+        await autoRenameBookmark(id, bookmark);
+        const latest = await chrome.bookmarks.get(id).catch(() => null);
+        await autoClassify(id, latest && latest[0] ? latest[0] : bookmark);
+      }).catch(() => {});
     }, AUTO_BOOKMARK_DEBOUNCE_MS);
     pendingBookmarkCreate.set(id, timer);
   });
@@ -598,7 +652,7 @@
   async function scheduleDedupeAlarm(settings) {
     await chrome.alarms.clear(DEDUPE_ALARM);
     const resolved = settings || (await readSettings());
-    if (!resolved.autoDedupe) return;
+    if (!resolved.autoEnabled) return;
     const hours = Math.max(1, Math.min(168, parseInt(resolved.autoDedupeInterval, 10) || 24));
     chrome.alarms.create(DEDUPE_ALARM, {
       delayInMinutes: hours * 60,
@@ -607,6 +661,8 @@
   }
 
   async function runScheduledDedupe() {
+    const settings = await readSettings();
+    if (!settings.autoEnabled) return;
     const all = await NS.getAllBookmarks();
     const groups = NS.findDuplicates(all, { ignoreQuery: false });
     const keepIds = new Set(groups.map((group) => group.recommendedId));

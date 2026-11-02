@@ -13,15 +13,32 @@
   'use strict';
 
   const $ = (id) => document.getElementById(id);
-  const port = chrome.runtime.connect({ name: 'codex-bookmarks' });
+  const PORT_NAME = 'codex-bookmarks';
 
   let nextId = 1;
   const pending = new Map();
+  let port = null;
   let bookmarkState = null;
   let preview = null;
   let duplicates = null;
 
-  port.onMessage.addListener((message) => {
+  function connectionError(detail) {
+    const text = String((detail && detail.message) || detail || '');
+    const staleContext = /context invalidated|receiving end does not exist|extension context/i.test(text);
+    const message = staleContext
+      ? '扩展已重新加载，旧设置页已经失去连接。请关闭并重新打开设置页后再整理。'
+      : '扩展后台连接已断开，本次操作没有完成。请再点一次；连续失败时请重新打开设置页。';
+    const error = new Error(message);
+    error.isPortDisconnect = true;
+    return error;
+  }
+
+  function rejectPending(error) {
+    for (const job of pending.values()) job.reject(error);
+    pending.clear();
+  }
+
+  function handleMessage(message) {
     if (!message || typeof message !== 'object') return;
     if (message.progress) {
       paintProgress(message.progress);
@@ -32,13 +49,58 @@
     pending.delete(message.id);
     if (message.ok) job.resolve(message.data);
     else job.reject(new Error(message.error || '操作失败'));
-  });
+  }
+
+  function connectPort() {
+    if (port) return port;
+    let next;
+    try {
+      // Reading runtime.id also detects an extension page left open across a
+      // reload, where creating a fresh port would otherwise throw an opaque error.
+      if (!chrome.runtime || !chrome.runtime.id) throw new Error('Extension context invalidated');
+      next = chrome.runtime.connect({ name: PORT_NAME });
+    } catch (error) {
+      throw connectionError(error);
+    }
+    port = next;
+    next.onMessage.addListener(handleMessage);
+    next.onDisconnect.addListener(() => {
+      // Reading lastError here prevents Chrome's unchecked-runtime-error log.
+      const lastError = chrome.runtime && chrome.runtime.lastError;
+      if (port !== next) return;
+      port = null;
+      rejectPending(connectionError(lastError));
+    });
+    return next;
+  }
 
   function ask(type, extra) {
     const id = nextId++;
     return new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
-      port.postMessage(Object.assign({ id, type }, extra || {}));
+      const send = (canRetry) => {
+        let connection;
+        try {
+          connection = connectPort();
+        } catch (error) {
+          reject(error);
+          return;
+        }
+        pending.set(id, { resolve, reject });
+        try {
+          connection.postMessage(Object.assign({ id, type }, extra || {}));
+        } catch (error) {
+          pending.delete(id);
+          if (port === connection) port = null;
+          // A disconnected object throws before delivering the message, so one
+          // retry is safe for both previews and bookmark-changing operations.
+          if (canRetry) {
+            send(false);
+            return;
+          }
+          reject(connectionError(error));
+        }
+      };
+      send(true);
     });
   }
 
@@ -61,6 +123,22 @@
 
   function paintProgress(progress) {
     if (!progress) return;
+    if (progress.kind === 'inspect') {
+      const read = Number(progress.read) || 0;
+      const unread = (Number(progress.failed) || 0) + (Number(progress.partial) || 0);
+      const bits = ['正在后台打开网页读取正文 ' + progress.done + ' / ' + progress.total];
+      if (read) bits.push('已读到 ' + read);
+      if (unread) bits.push('内容不足 ' + unread);
+      showProgress(
+        bits.join(' · '),
+        progress.total ? Math.round((progress.done / progress.total) * 100) : null
+      );
+      return;
+    }
+    if (progress.kind === 'classify-empty') {
+      showProgress('没有读到足够正文，保留书签原位置', 100);
+      return;
+    }
     if (progress.kind === 'rename') {
       showProgress(
         '正在生成精简名称 ' + progress.done + ' / ' + progress.total + ' 批',
@@ -201,7 +279,7 @@
   }
 
   const AUTO_CLASSIFY_STATE = {
-    off: '自动分类没开',
+    off: '自动功能没开',
     'no-category': '没拿到分类',
     gone: '书签已经不在',
     'already-there': '已经在那个文件夹里',
@@ -248,13 +326,12 @@
 
     const move = $('bmMoveClassified');
     if (move) move.checked = settings.moveClassified !== false;
-    setSwitch('bmAutoClassify', settings.autoClassify);
-    setSwitch('bmAutoRename', settings.autoRename);
-    setSwitch('bmAutoDedupe', settings.autoDedupe);
+    const autoEnabled = Boolean(settings.autoEnabled);
+    setSwitch('bmAutoAll', autoEnabled);
     const interval = $('bmInterval');
     if (interval) interval.value = String(settings.autoDedupeInterval || 24);
     const intervalRow = $('bmIntervalRow');
-    if (intervalRow) intervalRow.hidden = !settings.autoDedupe;
+    if (intervalRow) intervalRow.hidden = !autoEnabled;
 
     const organize = last.organize;
     say(
@@ -450,7 +527,7 @@
     if (renames.length) bits.push('精简名称 ' + renames.length + ' 个');
     if (preview.duplicates && preview.duplicates.removeCount) bits.push('删重复 ' + preview.duplicates.removeCount);
     if (preview.skipped) bits.push('跳过 ' + preview.skipped);
-    if (preview.unclassified) bits.push('没分类 ' + preview.unclassified);
+    if (preview.unclassified) bits.push('未读到/未分类，保持原位 ' + preview.unclassified);
     const stats = $('bmPreviewStats');
     if (stats) stats.textContent = bits.join(' · ');
     box.hidden = false;
@@ -505,8 +582,8 @@
     const instruction = instructionInput ? instructionInput.value.trim() : '';
     const simplifyNames = Boolean($('bmOrganizeRename') && $('bmOrganizeRename').checked);
     say('bmResult', '');
-    setBusy(button, true, simplifyNames ? '正在整理并精简名称…' : '正在扫描并分类…');
-    showProgress('正在扫描书签…', null);
+    setBusy(button, true, simplifyNames ? '正在整理并精简名称…' : '正在读取网页正文…');
+    showProgress('正在后台打开网页，读取实际正文后再分类…', null);
     try {
       preview = await ask('organize-preview', { instruction, simplifyNames });
       preview.instruction = instruction;
@@ -649,16 +726,12 @@
   change('bmModel', () => saveSettings({ bookmarkModelId: $('bmModel').value }));
   change('bmInterval', () => saveSettings({ autoDedupeInterval: Number($('bmInterval').value) || 24 }));
 
-  for (const pair of [['bmAutoClassify', 'autoClassify'], ['bmAutoRename', 'autoRename'], ['bmAutoDedupe', 'autoDedupe']]) {
-    const id = pair[0];
-    const key = pair[1];
-    click(id, () => {
-      const button = $(id);
-      const next = !button.classList.contains('on');
-      setSwitch(id, next);
-      saveSettings({ [key]: next });
-    });
-  }
+  click('bmAutoAll', () => {
+    const button = $('bmAutoAll');
+    const next = !button.classList.contains('on');
+    setSwitch('bmAutoAll', next);
+    saveSettings({ autoEnabled: next });
+  });
 
   // Automatic runs happen in the background, so re-read the state every time
   // the pane is opened instead of showing whatever was true at page load.
