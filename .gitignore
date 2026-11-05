@@ -1,0 +1,11 @@
+# Packaged extension archives and release verification output
+dist/
+
+# Dependencies
+node_modules/
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
