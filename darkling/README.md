@@ -23,7 +23,7 @@
 - 扩展设置页 → 左侧「外观 / 暗色模式」：开关、黑名单增删
 - 右键菜单：`切换暗黑模式` / `切换明亮模式`
 - 右键菜单：`添加暗黑模式黑名单` / `移除暗黑模式黑名单`
-- 右键菜单：`暗色模式设置…`（小窗打开面板，带上当前页 URL）
+- 右键菜单：`设置`（打开扩展设置页，内含暗色模式与翻译设置）
 - 快捷键 `Alt+Shift+D`
 
 开关状态存在 `chrome.storage.local` 的 `enabled` / `blacklist`，**默认关闭**。
@@ -42,8 +42,7 @@
 | 4 | 切换暗黑模式 / 切换明亮模式 | page | 引擎开关 |
 | 5 | 添加暗黑模式黑名单 / 移除暗黑模式黑名单 | page | 当前页是否在黑名单 |
 | 6 | —（分隔线） | page | — |
-| 7 | 暗色模式设置… | page | — |
-| 8 | 翻译设置 | page / selection | — |
+| 7 | 设置 | page / selection | — |
 
 翻译状态由 `translate/content.js` 上报（`translate:page-state`），`translate/engine.js` 存在
 `translatedTabs` 里并触发标题刷新；标签页导航或关闭时清除。菜单 id 见 `engine.js` 的

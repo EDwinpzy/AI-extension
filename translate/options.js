@@ -594,7 +594,45 @@ function readModalModel() {
   };
 }
 
-$('addModel').addEventListener('click', () => openModelModal(-1));
+$('addModelBtn').addEventListener('click', () => openModelModal(-1));
+
+/* 模拟整页测速：同样一屏英文段落逐个跑已添加的模型，按真实翻译耗时排。 */
+$('speedTestAll').addEventListener('click', async () => {
+  const button = $('speedTestAll');
+  const result = $('speedResult');
+  const models = Array.isArray(state && state.models) ? state.models : [];
+  if (models.length < 2) {
+    result.hidden = false;
+    result.className = 'result';
+    result.textContent = '至少添加两个模型才能对比测速。';
+    return;
+  }
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = '测速中…';
+  result.hidden = false;
+  result.className = 'result';
+  result.textContent = '正在用一屏英文段落模拟真实整页翻译，共 ' + models.length + ' 个模型…';
+  const reply = await send({ type: 'translate:speed-test' }).catch(() => null);
+  const rows = reply && Array.isArray(reply.rows) ? reply.rows : [];
+  if (!reply || !reply.ok || !rows.length) {
+    result.className = 'result bad';
+    result.textContent = '测速失败：' + (reply && reply.error ? String(reply.error) : '未知错误');
+  } else {
+    const fastest = rows.find((row) => row.ok);
+    const lines = rows.map((row, index) => {
+      if (!row.ok) return (index + 1) + '. ' + row.name + ' —— 失败（' + String(row.error || '无法连接').slice(0, 60) + '）';
+      const per = row.blocks ? '（' + row.blocks + ' 段 / 约 ' + Math.round((row.elapsedMs * 1000) / row.blocks) + ' ms 一段）' : '';
+      return (index + 1) + '. ' + row.name + ' —— ' + row.elapsedMs + ' ms' + per + (fastest && row === fastest ? '（最快）' : '');
+    });
+    result.textContent =
+      '模拟整页测速完成：一屏 ' + (reply.sampleBlocks || '若干') + ' 段英文，同样目标语言逐个测\n' +
+      lines.join('\n') +
+      (fastest ? '\n最快：' + fastest.name + '（' + fastest.elapsedMs + ' ms）' : '');
+  }
+  button.disabled = false;
+  button.textContent = label;
+});
 $('cancelModel').addEventListener('click', closeModelModal);
 $('modelModal').addEventListener('click', (event) => {
   if (event.target === $('modelModal')) closeModelModal();
@@ -671,6 +709,9 @@ $('saveModel').addEventListener('click', () => {
   save(patch);
   closeModelModal();
   renderModels();
+  // The subtitle panel keeps its own <select>; refresh it so a just-saved
+  // model appears there without reopening the settings page.
+  renderSubtitle();
 });
 
 /* --------------------------------------------------------------- display */

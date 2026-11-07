@@ -12,8 +12,7 @@
  *   切换暗黑模式 / 切换明亮模式
  *   添加暗黑模式黑名单 / 移除暗黑模式黑名单
  *   ---
- *   暗色模式设置…
- *   翻译设置
+ *   设置
  *
  * Labels follow the state of the active tab, so they are refreshed on tab
  * switches and whenever the page reports that it was translated or restored.
@@ -23,14 +22,11 @@ const CODEX_MENU = {
   selection: 'translate-selection',
   page: 'translate-page',
   summary: 'translate-summary',
-  settings: 'translate-settings',
+  settings: 'extension-settings',
   darkToggle: 'darkling-toggle',
   darkBlacklist: 'darkling-blacklist',
-  darkPanel: 'darkling-panel',
   separator: 'codex-menu-separator',
 };
-
-const DARKLING_PANEL_PAGE = 'darkling/popup/popup.html';
 
 let menuRefreshTimer = 0;
 let menuInstalling = false;
@@ -119,13 +115,8 @@ function installContextMenus(force) {
       contexts: ['page'],
     });
     createMenu({
-      id: CODEX_MENU.darkPanel,
-      title: '暗色模式设置…',
-      contexts: ['page'],
-    });
-    createMenu({
       id: CODEX_MENU.settings,
-      title: '翻译设置',
+      title: '设置',
       contexts: ['page', 'selection'],
     });
 
@@ -160,14 +151,6 @@ async function darklingToggleBlacklist(tab) {
   }, 260);
 }
 
-function darklingOpenPanel(tab) {
-  const page = chrome.runtime.getURL(DARKLING_PANEL_PAGE);
-  const url = tab && typeof tab.url === 'string' && /^https?:/i.test(tab.url)
-    ? `${page}?url=${encodeURIComponent(tab.url)}`
-    : page;
-  chrome.windows.create({ url, type: 'popup', width: 290, height: 240 }).catch(() => {});
-}
-
 /* ----------------------------------------------------------------- wiring */
 
 installContextMenus(false);
@@ -185,8 +168,6 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     darklingToggle();
   } else if (info.menuItemId === CODEX_MENU.darkBlacklist) {
     darklingToggleBlacklist(tab);
-  } else if (info.menuItemId === CODEX_MENU.darkPanel) {
-    darklingOpenPanel(tab);
   }
 });
 

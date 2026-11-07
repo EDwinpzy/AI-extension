@@ -106,6 +106,32 @@ async function persistCache() {
   }
 }
 
+/* LRU touch on a shared hit: re-inserting at the tail keeps frequently used
+ * translations in storage and lets stale ones age out. */
+function cacheTouch(key) {
+  const value = memoryCache.get(key);
+  if (value === undefined) return;
+  memoryCache.delete(key);
+  memoryCache.set(key, value);
+}
+
+/* A translation is a translation: whichever model produced it, the text is
+ * already known. Any cached entry for the same text+lang beats a model call,
+ * so switching models or failing over cannot re-pay for seen text. */
+function findCachedTranslation(text, lang, variant) {
+  const wanted = lang + '|';
+  const suffix = variant ? '|' + variant + '|' + text : '|' + text;
+  for (const [key, value] of memoryCache) {
+    if (!key.startsWith(wanted) || !key.endsWith(suffix)) continue;
+    if (typeof value !== 'string' || !value.trim()) continue;
+    const modelPart = key.slice(wanted.length, key.length - suffix.length);
+    if (modelPart.includes('|')) continue;
+    cacheTouch(key);
+    return value;
+  }
+  return null;
+}
+
 /* ------------------------------------------------------------------ text */
 
 // Strips reasoning wrappers some gateways emit despite being asked not to.
@@ -1038,7 +1064,12 @@ async function translateTexts(texts, targetLang, purpose, options) {
      */
     const misses = [];
     for (const entry of todo) {
-      const hit = cacheGet(cacheKey(entry.text.trim(), lang, modelKey, variantFor(entry.budget)));
+      const trimmed = entry.text.trim();
+      const variant = variantFor(entry.budget);
+      /* Same-model first, then any model: both mean the text was translated before. */
+      const hit =
+        cacheGet(cacheKey(trimmed, lang, modelKey, variant)) ||
+        findCachedTranslation(trimmed, lang, variant);
       if (hit === null) misses.push(entry);
       else {
         results[entry.index] = hit;
@@ -1208,6 +1239,137 @@ async function handleTranslateBatch(message) {
   }
 }
 
+/* A realistic English-page passage: 24 short blocks (titles, two-sentence
+ * paragraphs, a caption, a number line) chosen because they look like what
+ * collectUnits() hands over on a news page. The same set is used for every
+ * model, so only the model changes between runs. */
+const SPEED_SAMPLE = [
+  'Machine learning models need data.',
+  'The city council approved the new transit plan on Tuesday after a long debate.',
+  'Researchers say the treatment reduced symptoms by nearly half.',
+  'Local farmers expect a smaller harvest this year because of the drought.',
+  'The museum will close for renovations starting next month.',
+  'Shares rose after the company reported better than expected earnings.',
+  'A new study shows that daily walking improves heart health.',
+  'The airport announced delays because of heavy fog this morning.',
+  'Electric vehicle sales grew by 32 percent in the first quarter.',
+  'Students can register for the fall semester online until Friday.',
+  'The restaurant chain said it will open ten new locations by December.',
+  'Scientists discovered a galaxy that is far older than expected.',
+  'The library extended its opening hours during the exam season.',
+  'Police said the road will be closed for repairs over the weekend.',
+  'The new software update fixes several security issues.',
+  'Travelers should arrive at the airport at least two hours early.',
+  'The football team signed a contract with a young striker.',
+  'Home prices fell slightly in most major cities last month.',
+  'The concert sold out within an hour of going on sale.',
+  'Engineers are testing a bridge that can survive strong earthquakes.',
+  'The weather forecast predicts rain for the next three days.',
+  'A charity collected more than two million dollars for flood victims.',
+  'The smartphone uses a battery that lasts two days on a single charge.',
+  'High school students won first place at the robotics competition.',
+];
+
+/* A full page takes far too long to be a useful test, and 24 blocks is
+ * already 3 engine batches - so this is a screenful, not a whole site. */
+const SPEED_BATCH_SLICES = 40;
+
+/* One model, one attempt, no cache and no failover: whatever it costs in the
+ * real scenario is what the number says. Cache and failover are skipped on
+ * purpose - a cached run would read 0 ms, and a failover run would measure
+ * the other model. */
+async function speedRunOne(model, settings, lang) {
+  const started = Date.now();
+  const blocks = SPEED_SAMPLE.slice();
+  const allTerms = typeof mergeGlossary === 'function' ? mergeGlossary(settings.glossary) : [];
+  const keepNames = typeof keepNameMatcher === 'function' ? keepNameMatcher(allTerms) : null;
+  const entries = [];
+  blocks.forEach((text) => {
+    if (typeof shouldSkipTranslation === 'function' && shouldSkipTranslation(text, lang)) return;
+    if (typeof isOnlyKeepNames === 'function' && keepNames && isOnlyKeepNames(text, keepNames)) return;
+    entries.push({ text });
+  });
+  if (!entries.length) return { ok: false, error: '样本无法翻译' };
+
+  const slices = [];
+  for (let index = 0; index < entries.length; index += SPEED_BATCH_SLICES) {
+    slices.push(entries.slice(index, index + SPEED_BATCH_SLICES));
+  }
+  let failures = 0;
+  let firstError = null;
+  let firstBatchAt = 0;
+  const workers = [];
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < slices.length) {
+      const batch = slices[cursor++];
+      const payload = batch.map((entry) => entry.text);
+      const glossary = pickGlossaryFor(payload, allTerms);
+      const messages = buildMessages(lang, payload, glossary, {
+        budgets: batch.map(() => 0),
+        purpose: undefined,
+        context: '',
+      });
+      try {
+        const at = Date.now();
+        const raw = await callModel(messages, {
+          baseUrl: model.baseUrl,
+          apiKey: model.apiKey,
+          model: model.model,
+          dialect: model.dialect,
+          disableThinking: settings.disableThinking !== false,
+          timeoutMs: REQUEST_TIMEOUT_MS,
+          maxTokens: estimateMaxTokens(payload, lang),
+        });
+        if (!firstBatchAt) firstBatchAt = at;
+        const parsed = parseTranslationOutput(raw, payload.length);
+        if (!parsed || !parsed.some((value) => value && value.trim())) {
+          failures++;
+          if (!firstError) firstError = new Error('模型返回了空结果');
+        }
+      } catch (error) {
+        failures++;
+        if (!firstError) firstError = error;
+      }
+    }
+  };
+  const crew = Math.min(4, slices.length);
+  for (let index = 0; index < crew; index++) workers.push(worker());
+  await Promise.all(workers);
+
+  if (failures === slices.length) {
+    return { ok: false, error: String((firstError && firstError.message) || firstError) };
+  }
+  const elapsedMs = Date.now() - started;
+  const blocksDone = entries.length - Math.min(failures, entries.length);
+  return { ok: true, elapsedMs, blocks: blocksDone };
+}
+
+async function handleSpeedTest(request) {
+  const settings = await readTranslateSettings();
+  const lang = settings.targetLang || 'zh-CN';
+  const models = Array.isArray(settings.models) ? settings.models : [];
+  const rows = [];
+  for (const model of models) {
+    const row = await speedRunOne(model, settings, lang);
+    rows.push({
+      id: model.id,
+      name: model.name || model.model || '未命名',
+      elapsedMs: row.elapsedMs || null,
+      blocks: row.blocks || 0,
+      ok: Boolean(row.ok),
+      error: row.error || '',
+    });
+  }
+  rows.sort((a, b) => {
+    if (!a.ok && b.ok) return 1;
+    if (a.ok && !b.ok) return -1;
+    if (!a.ok && !b.ok) return 0;
+    return a.elapsedMs - b.elapsedMs;
+  });
+  return { ok: true, rows, sampleBlocks: SPEED_SAMPLE.length };
+}
+
 async function handleTestModel(request) {
   const settings = await readTranslateSettings();
   let model = null;
@@ -1290,6 +1452,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     handleTestModel(message).then(sendResponse);
     return true;
   }
+  if (message.type === 'translate:speed-test') {
+    handleSpeedTest(message).then(sendResponse, (error) => sendResponse({ ok: false, error: String((error && error.message) || error) }));
+    return true;
+  }
   if (message.type === 'translate:list-models') {
     handleListModels(message).then(
       sendResponse,
@@ -1338,7 +1504,7 @@ const TRANSLATE_MENU = {
   SELECTION: 'translate-selection',
   PAGE: 'translate-page',
   SUMMARY: 'translate-summary',
-  SETTINGS: 'translate-settings',
+  SETTINGS: 'extension-settings',
 };
 
 const translatedTabs = new Set();
