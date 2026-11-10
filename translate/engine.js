@@ -16,7 +16,13 @@ const CACHE_PERSIST_LIMIT = 4000;
 const CONCURRENCY = 8;
 const BATCH_MAX_ITEMS = 40;
 const BATCH_MAX_CHARS = 4000;
-const REQUEST_TIMEOUT_MS = 60000;
+/*
+ * Reasoning models can spend most of a small output budget before writing the
+ * first translated line. Sixty seconds used to abort requests that were still
+ * making progress; ninety covers a complete page-sized batch while a dead
+ * endpoint still fails within a bounded wait.
+ */
+const REQUEST_TIMEOUT_MS = 90000;
 /* One batch gets at most three model calls, and never an output budget above
  * this, so a misbehaving model cannot turn into a wall of requests. */
 const MAX_ATTEMPTS = 3;
@@ -321,7 +327,12 @@ function estimateMaxTokens(texts, lang) {
   const ratio = cjk ? 0.75 : 1.15;
   const perItem = cjk ? 10 : 14;
   const estimate = Math.ceil(chars * ratio + texts.length * perItem + 64);
-  return Math.max(512, Math.min(8192, estimate));
+  /*
+   * The floor has to pay for a reasoning model's hidden work as well as the
+   * visible translation. At 512 an eight-line batch could spend the whole
+   * budget thinking and come back empty, which then bought two more attempts.
+   */
+  return Math.max(1024, Math.min(8192, estimate));
 }
 
 /*
@@ -417,10 +428,16 @@ function buildMessages(lang, texts, glossary, options) {
         .join('\n')
     : '';
 
+  /*
+   * Keep the instruction compact. On reasoning-only models every extra line
+   * of prompt is another thing to analyse: the long version spent hundreds of
+   * reasoning tokens before translating eight interface labels, while this
+   * version keeps the same numbered-line contract and gets to the output in a
+   * fraction of the time.
+   */
   const format =
-    'Output ONLY translated lines, keeping [n] order, exactly ' + texts.length + ' lines:\n' +
-    '[1] translated line 1\n[2] translated line 2\n' +
-    'No merge, no split, no explanation, no markdown, no code fence, no blank lines.';
+    'Return only the [n] translated lines, in the same order, exactly ' + texts.length + ' lines. ' +
+    'No merge, no split, no explanation, no notes, no markdown, no step-by-step thinking.';
 
   /*
    * Interface copy is where a literal translation hurts: it either overflows
@@ -429,12 +446,8 @@ function buildMessages(lang, texts, glossary, options) {
    * "keep it short" to "compress it".
    */
   const task = limits
-    ? 'Translate and compress each numbered line to ' + name + '. These are interface labels that have to fit a fixed ' +
-      'box, so every result must stay inside the character limit listed below. Prefer the shortest natural wording: ' +
-      'drop qualifiers, repeated product names and filler before dropping meaning.'
-    : 'Translate each numbered line to ' + name + '. Interface text - labels, menu items, buttons, tabs, table ' +
-      'headers, short headings - must be short and idiomatic: use the wording a ' + name + ' product would ship, ' +
-      'never a word-for-word rendering. Body paragraphs stay complete and faithful.';
+    ? 'Translate each numbered line to ' + name + '. Compress UI text to the character limit below; drop filler before meaning.'
+    : 'Translate each numbered line to ' + name + '. Keep UI labels short and natural; keep paragraphs complete and faithful.';
 
   return [
     { role: 'system', content: task + '\n' + format + limits + names + translations },
@@ -891,6 +904,12 @@ async function callModel(messages, options) {
           ? String(data.stop_reason)
           : incomplete;
       const truncated = finish === 'length' || finish === 'max_tokens' || finish === 'max_output_tokens';
+      const reasoningTokens = Number(
+        data &&
+          data.usage &&
+          data.usage.completion_tokens_details &&
+          data.usage.completion_tokens_details.reasoning_tokens
+      ) || 0;
       // The raw body used to be pasted into the page's progress pill; it now
       // goes to the worker console, where it is actually useful.
       console.warn('[translate] the model returned no content', {
@@ -905,6 +924,7 @@ async function callModel(messages, options) {
       const error = new Error('模型没有返回内容' + why);
       if (truncated) error.retryReason = 'truncated';
       else if (disableThinking) error.retryReason = 'empty';
+      error.reasoningTokens = reasoningTokens;
       throw error;
     }
     return content;
@@ -955,11 +975,22 @@ async function callModel(messages, options) {
         note('上游短暂不可用，已重试 ' + error.upstreamRefusals + ' 次');
       } else if (reason === 'truncated' && attempt.maxTokens < MAX_OUTPUT_TOKENS) {
         const bigger = Math.min(Math.max(attempt.maxTokens * 4, 2048), MAX_OUTPUT_TOKENS);
-        note('已加大输出上限重试');
-        queue.push({ disableThinking: attempt.disableThinking, maxTokens: bigger });
-        if (attempt.disableThinking) {
-          note('已去掉关闭思考的参数重试');
+        if (attempt.disableThinking && error.reasoningTokens > 0) {
+          /*
+           * The model spent the budget on reasoning even though the switch was
+           * sent. Repeating the identical request would waste another timeout;
+           * go straight to the larger budget without spending a retry on the
+           * switch the model already ignored.
+           */
+          note('模型忽略了关闭思考，已加大输出上限重试');
           queue.push({ disableThinking: false, maxTokens: bigger });
+        } else {
+          note('已加大输出上限重试');
+          queue.push({ disableThinking: attempt.disableThinking, maxTokens: bigger });
+          if (attempt.disableThinking) {
+            note('已去掉关闭思考的参数重试');
+            queue.push({ disableThinking: false, maxTokens: bigger });
+          }
         }
       } else if (attempt.disableThinking) {
         note('已去掉关闭思考的参数重试');

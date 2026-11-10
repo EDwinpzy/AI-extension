@@ -33,7 +33,9 @@
   const RERUN_DEBOUNCE_MS = 900;
   const RERUN_COOLDOWN_MS = 2500;
   const RERUN_LIMIT = 60;
+  const SCROLL_DEBOUNCE_MS = 450;
   let rerunTimer = null;
+  let scrollTimer = null;
   let rerunCount = 0;
   let lastRunAt = 0;
   let contentObserver = null;
@@ -851,13 +853,51 @@
     return units.slice(0, MAX_UNITS);
   }
 
+  /*
+   * The page is translated in request-sized slices, and the user is usually
+   * looking at only one screen of it. Reading order is right when the pass
+   * starts at the top; after a scroll it can leave the visible article behind
+   * hundreds of off-screen blocks. Put what is on screen first, then the
+   * nearest blocks above and below, and keep the original order inside each
+   * distance so the page still fills in naturally.
+   */
+  function prioritizeUnits(units) {
+    const viewportBottom = window.innerHeight || 0;
+    return units
+      .map((unit, index) => {
+        let distance = Number.POSITIVE_INFINITY;
+        try {
+          const rect = unit.element.getBoundingClientRect();
+          if (rect.width || rect.height || rect.top || rect.bottom) {
+            if (rect.bottom >= 0 && rect.top <= viewportBottom) distance = 0;
+            else if (rect.bottom < 0) distance = -rect.bottom;
+            else distance = rect.top - viewportBottom;
+          }
+        } catch (error) {
+          /* a detached or exotic element sorts last instead of breaking the pass */
+        }
+        return { unit, distance, index };
+      })
+      .sort((first, second) => {
+        if (first.distance !== second.distance) return first.distance - second.distance;
+        return first.index - second.index;
+      })
+      .map((entry) => entry.unit);
+  }
+
   function looksLikeTargetLanguage(units) {
-    const sample = units.slice(0, 24).map((unit) => unit.text).join(' ');
+    /*
+     * A fixed first-screen sample is not enough: after the navigation has been
+     * translated, the next catch-up pass can see twenty-four Chinese labels
+     * above an English article and decide the whole page is already finished.
+     * Measure the whole visible batch instead, and require a clear CJK lead.
+     */
+    const sample = units.slice(0, 200).map((unit) => unit.text).join(' ');
     if (!sample) return false;
     const cjk = (sample.match(/[\u4e00-\u9fff]/g) || []).length;
     const latin = (sample.match(/[A-Za-z]/g) || []).length;
     const lang = (settings && settings.targetLang) || 'zh-CN';
-    if (/^(zh|cn|yue)/i.test(lang)) return cjk > latin;
+    if (/^(zh|cn|yue)/i.test(lang)) return cjk > Math.max(12, latin * 1.2);
     return false;
   }
 
@@ -1331,9 +1371,15 @@
       return;
     }
 
-    pageRun = { units, cancelled: false, finished: false, done: 0 };
+    /*
+     * collectUnits() walks the document from top to bottom. Once the reader has
+     * scrolled, the interesting blocks are wherever the viewport is now, not
+     * at the front of that list.
+     */
+    const ordered = prioritizeUnits(units);
+    pageRun = { units: ordered, cancelled: false, finished: false, done: 0 };
     const run = pageRun;
-    if (!quiet) renderProgress(0, units.length);
+    if (!quiet) renderProgress(0, ordered.length);
 
     try {
       /*
@@ -1344,12 +1390,12 @@
        */
       const slices = [];
       let from = 0;
-      if (units.length > BATCH_FIRST_UNITS + BATCH_UNITS) {
-        slices.push(units.slice(0, BATCH_FIRST_UNITS));
+      if (ordered.length > BATCH_FIRST_UNITS + BATCH_UNITS) {
+        slices.push(ordered.slice(0, BATCH_FIRST_UNITS));
         from = BATCH_FIRST_UNITS;
       }
-      for (let index = from; index < units.length; index += BATCH_UNITS) {
-        slices.push(units.slice(index, index + BATCH_UNITS));
+      for (let index = from; index < ordered.length; index += BATCH_UNITS) {
+        slices.push(ordered.slice(index, index + BATCH_UNITS));
       }
       let cursor = 0;
       let failed = 0;
@@ -1368,8 +1414,8 @@
           if (run.cancelled) return;
           slice.forEach((unit, position) => applyTranslation(unit, translations[position]));
           /* Batches land out of order, so the count only ever grows. */
-          run.done = Math.min(run.done + slice.length, units.length);
-          if (!quiet) renderProgress(run.done, units.length);
+          run.done = Math.min(run.done + slice.length, ordered.length);
+          if (!quiet) renderProgress(run.done, ordered.length);
         }
       };
       const workers = [];
@@ -1382,7 +1428,7 @@
     } catch (error) {
       if (quiet) noteState('quiet:error ' + String((error && error.message) || error).slice(0, 70));
       if (!quiet) {
-        renderProgress(run.done, units.length, '翻译出错：' + String((error && error.message) || error).slice(0, 60));
+        renderProgress(run.done, ordered.length, '翻译出错：' + String((error && error.message) || error).slice(0, 60));
         setTimeout(hideProgress, 4000);
       }
       pageRun.finished = true;
@@ -1390,14 +1436,14 @@
     }
 
     if (!run.cancelled && !quiet) {
-      renderProgress(units.length, units.length, '已翻译 ' + units.length + ' 段');
+      renderProgress(ordered.length, ordered.length, '已翻译 ' + ordered.length + ' 段');
       setTimeout(hideProgress, 1500);
     }
     if (!run.cancelled) {
       reportPageState(true);
     }
     run.finished = true;
-    if (quiet) noteState('quiet:done ' + units.length + (run.cancelled ? ' cancelled' : ''));
+    if (quiet) noteState('quiet:done ' + ordered.length + (run.cancelled ? ' cancelled' : ''));
   }
 
   /*
@@ -1464,6 +1510,27 @@
       rerunTimer = null;
       maybeRerun();
     }, RERUN_DEBOUNCE_MS);
+  }
+
+  /*
+   * A scroll is a reading event, not background mutation. Long articles can
+   * put the next blocks in the DOM before the first pass reaches them, and
+   * infinite feeds add new blocks while the reader moves - neither necessarily
+   * produces a childList change at the moment the reader needs translation.
+   * Debounce until the movement settles, then run a quiet catch-up pass.
+   */
+  function scheduleScrollRerun() {
+    if (!settings || settings.autoTranslateAll === false || blocked()) return;
+    if (scrollTimer) clearTimeout(scrollTimer);
+    scrollTimer = setTimeout(() => {
+      scrollTimer = null;
+      if (document.hidden) return;
+      // Scrolling earns a fresh catch-up budget; the old cap was meant to stop
+      // a noisy page from looping on its own, not to retire translation after
+      // the sixtieth screen.
+      rerunCount = 0;
+      maybeRerun();
+    }, SCROLL_DEBOUNCE_MS);
   }
 
   function maybeRerun() {
@@ -1586,6 +1653,7 @@
 
   window.addEventListener('scroll', () => {
     if (current && host) clear();
+    scheduleScrollRerun();
   }, { passive: true });
 
   chrome.runtime.onMessage.addListener((message) => {
