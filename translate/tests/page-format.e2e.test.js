@@ -132,6 +132,21 @@ function startFixtureServer() {
       return;
     }
 
+    if (request.url === '/long') {
+      const paragraphs = Array.from({ length: 520 }, (_, index) => {
+        const number = index + 1;
+        return '<p id="block-' + number + '">Community story ' + number +
+          ': a long page keeps adding readable paragraphs below the first screen.</p>';
+      }).join('\n');
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end(`<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Long fixture</title></head>
+<body>${paragraphs}</body>
+</html>`);
+      return;
+    }
+
     response.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
     response.end('not found');
   });
@@ -162,7 +177,7 @@ async function safeRemoveProfile(profile) {
 }
 
 test('page translation keeps original spaces and line breaks', {
-  timeout: 90000,
+  timeout: 120000,
   skip: findEdge() ? false : 'Microsoft Edge is not installed',
 }, async () => {
   const fixture = await startFixtureServer();
@@ -188,6 +203,7 @@ test('page translation keeps original spaces and line breaks', {
   let browser = null;
   let worker = null;
   let page = null;
+  let longPage = null;
   try {
     await waitForJson('http://127.0.0.1:' + debugPort + '/json/version', 15000);
     const version = await waitForJson('http://127.0.0.1:' + debugPort + '/json/version', 1000);
@@ -437,6 +453,87 @@ test('page translation keeps original spaces and line breaks', {
       awaitPromise: true,
       returnByValue: true,
     });
+
+    /*
+     * A long page is capped at 500 units per pass. The rest has to be picked
+     * up by scrolling, not by a childList mutation: this fixture never adds a
+     * node after load.
+     */
+    const longUrl = fixture.baseUrl + '/long';
+    await browser.send('Target.createTarget', { url: longUrl });
+    let longTarget = null;
+    const longDeadline = Date.now() + 15000;
+    while (Date.now() < longDeadline && !longTarget) {
+      const targets = await waitForJson('http://127.0.0.1:' + debugPort + '/json/list', 2000);
+      longTarget = targets.find((target) => target.type === 'page' && target.url === longUrl);
+      if (!longTarget) await wait(150);
+    }
+    assert.ok(longTarget, 'long fixture page did not open');
+
+    longPage = await new CdpClient(longTarget.webSocketDebuggerUrl).open();
+    await longPage.send('Runtime.enable');
+    const initialLong = await longPage.send('Runtime.evaluate', {
+      expression: `(async () => {
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const deadline = Date.now() + 30000;
+        while (Date.now() < deadline) {
+          if (document.querySelectorAll('[data-codex-translated]').length >= 480) break;
+          await sleep(100);
+        }
+        return {
+          marked: document.querySelectorAll('[data-codex-translated]').length,
+          bottomMarked: document.getElementById('block-520').hasAttribute('data-codex-translated'),
+          height: document.documentElement.scrollHeight,
+        };
+      })()`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    if (initialLong.exceptionDetails) {
+      throw new Error(initialLong.exceptionDetails.text || 'long fixture evaluation failed');
+    }
+    const beforeScroll = initialLong.result.value;
+    assert.ok(beforeScroll.marked >= 480, 'initial pass did not translate the first 500 blocks');
+    assert.equal(beforeScroll.bottomMarked, false, 'bottom block was translated before it was reached');
+
+    const scrolled = await longPage.send('Runtime.evaluate', {
+      expression: `(() => {
+        window.scrollTo(0, document.documentElement.scrollHeight);
+        return { y: window.scrollY, height: document.documentElement.scrollHeight };
+      })()`,
+      returnByValue: true,
+    });
+    if (scrolled.exceptionDetails) {
+      throw new Error(scrolled.exceptionDetails.text || 'long fixture scroll failed');
+    }
+    assert.ok(scrolled.result.value.y > 0, 'long fixture did not scroll');
+
+    const afterScroll = await longPage.send('Runtime.evaluate', {
+      expression: `(async () => {
+        const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        const deadline = Date.now() + 25000;
+        while (Date.now() < deadline) {
+          if (document.getElementById('block-520').hasAttribute('data-codex-translated')) break;
+          await sleep(150);
+        }
+        return {
+          marked: document.getElementById('block-520').hasAttribute('data-codex-translated'),
+          text: document.getElementById('block-520').textContent,
+          state: document.documentElement.getAttribute('data-codex-translate-state'),
+        };
+      })()`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    if (afterScroll.exceptionDetails) {
+      throw new Error(afterScroll.exceptionDetails.text || 'long fixture catch-up failed');
+    }
+    const afterValue = afterScroll.result.value;
+    assert.equal(
+      afterValue.marked,
+      true,
+      'scrolling did not translate the next batch: ' + JSON.stringify(afterValue)
+    );
   } finally {
     if (browser) {
       try { await browser.send('Browser.close'); } catch (error) {}
@@ -444,6 +541,7 @@ test('page translation keeps original spaces and line breaks', {
     }
     if (worker) worker.close();
     if (page) page.close();
+    if (longPage) longPage.close();
     await wait(300);
     if (edge.pid) {
       spawnSync('taskkill', ['/PID', String(edge.pid), '/T', '/F'], {
