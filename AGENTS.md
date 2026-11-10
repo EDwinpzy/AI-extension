@@ -10,6 +10,7 @@
 - **Search skip**: `dist/`, `node_modules/`, `.git/`, and generated browser data.
 - **Data boundary**: API keys and page text stay in browser storage or the configured model endpoint; never add secrets or captured user data to the repository.
 - **UI verification**: reload the unpacked extension and verify the relevant extension page or injected page behavior; a unit test alone does not prove browser UI behavior.
+- **Release**: bump `manifest.json`, run Tests, archive runtime entries only (`_locales/`, `background-loader.js`, `bookmarks/`, `darkling/`, `images/`, `launch.*`, `manifest.json`, `translate/`) as `AI-extension-vX.Y.Z.zip`, then create a GitHub Release with its SHA-256.
 
 ## Current boundaries
 
