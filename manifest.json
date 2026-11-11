@@ -40,6 +40,7 @@
       ],
       "js": [
         "translate/content.js",
+        "translate/summary.js",
         "translate/subtitle.js"
       ],
       "run_at": "document_idle",
