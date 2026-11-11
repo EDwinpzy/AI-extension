@@ -213,6 +213,22 @@ test('dynamic page content reaches classification from a real rendered tab', {
 
     worker = await new CdpClient(workerTarget.webSocketDebuggerUrl).open();
     await worker.send('Runtime.enable');
+    /*
+     * A worker target can be inspectable before importScripts has finished.
+     * Wait for the namespace the test calls instead of assuming the target
+     * appearing means every imported module has run.
+     */
+    const apiDeadline = Date.now() + 10000;
+    let bookmarksReady = false;
+    while (Date.now() < apiDeadline && !bookmarksReady) {
+      const probe = await worker.send('Runtime.evaluate', {
+        expression: 'typeof self.CodexBookmarks',
+        returnByValue: true,
+      });
+      bookmarksReady = Boolean(probe.result && probe.result.value === 'object');
+      if (!bookmarksReady) await wait(100);
+    }
+    assert.ok(bookmarksReady, 'bookmark worker API did not initialize');
     const expression = `(async () => {
       const progress = [];
       const results = await self.CodexBookmarks.classifyBookmarks(

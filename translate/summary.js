@@ -23,6 +23,15 @@
   const HOST_ID = 'codex-summary-page';
   const MAX_CHARS = 12000;
   const MIN_ARTICLE_CHARS = 200;
+  /*
+   * Pages that render their article after the first paint are common, and a
+   * right-click can land before the text exists. Give the document a short
+   * window to catch up instead of failing on the first, empty read.
+   */
+  const ARTICLE_WAIT_MS = 6000;
+  const ARTICLE_RETRY_MS = 500;
+  /* One long model call, with room for a slow provider and its retry. */
+  const SUMMARY_REPLY_TIMEOUT_MS = 140000;
 
   let host = null;
   let shadow = null;
@@ -339,6 +348,29 @@
     return { text: filterText(body), source: body ? 'body' : 'none' };
   }
 
+  async function articleTextWhenReady() {
+    if (document.readyState === 'loading') {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 3000);
+        document.addEventListener(
+          'DOMContentLoaded',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true }
+        );
+      });
+    }
+    const deadline = Date.now() + ARTICLE_WAIT_MS;
+    let found = articleText();
+    while ((!found.text || found.text.length < MIN_ARTICLE_CHARS / 4) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, ARTICLE_RETRY_MS));
+      found = articleText();
+    }
+    return found;
+  }
+
   /* -------------------------------------------------------------- render */
 
   function ensureHost() {
@@ -504,15 +536,25 @@
     const mine = ++token;
     try {
       render({ state: 'loading', title: '正在总结…' });
-      const found = articleText();
+      const found = await articleTextWhenReady();
       if (!found.text || found.text.length < MIN_ARTICLE_CHARS / 4) {
         render({ state: 'error', title: '总结', text: '没有提取到正文，换个页面试试' });
         return;
       }
       const clipped = found.text.length > MAX_CHARS ? found.text.slice(0, MAX_CHARS) : found.text;
-      const reply = await chrome.runtime
-        .sendMessage({ type: 'translate:summarize', text: clipped })
-        .catch((error) => ({ ok: false, error: String((error && error.message) || error) }));
+      let timer = 0;
+      const reply = await Promise.race([
+        chrome.runtime
+          .sendMessage({ type: 'translate:summarize', text: clipped })
+          .catch((error) => ({ ok: false, error: String((error && error.message) || error) })),
+        new Promise((resolve) => {
+          timer = setTimeout(
+            () => resolve({ ok: false, error: '总结超时，请稍后重试' }),
+            SUMMARY_REPLY_TIMEOUT_MS
+          );
+        }),
+      ]);
+      clearTimeout(timer);
       if (mine !== token) return;
       if (!reply || !reply.ok) {
         render({ state: 'error', title: '总结', text: (reply && reply.error) || '未知错误' });

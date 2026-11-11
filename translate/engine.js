@@ -472,9 +472,15 @@ function createLimiter(limit) {
         next();
       });
   };
-  return (task) =>
+  return (task, urgent) =>
     new Promise((resolve, reject) => {
-      waiting.push({ task, resolve, reject });
+      /*
+       * A click is a person waiting; background translation is not. An urgent
+       * job goes to the front of the queue so a whole-page summary cannot sit
+       * behind every remaining translation batch on a long article.
+       */
+      if (urgent) waiting.unshift({ task, resolve, reject });
+      else waiting.push({ task, resolve, reject });
       next();
     });
 }
@@ -1227,19 +1233,21 @@ async function handleSummarize(message) {
   let firstError = null;
   for (const model of models) {
     try {
-      const raw = await requestQueue(() =>
-        callModel(buildSummaryMessages(text), {
-          baseUrl: model.baseUrl,
-          apiKey: model.apiKey,
-          model: model.model,
-          dialect: model.dialect,
-          /* A summary is not a translation, but the "thinking off" switch is
-           * still the right call: it only asks the model to skip its reasoning
-           * pass, and a summary that spends the budget thinking is no summary. */
-          disableThinking: settings.disableThinking !== false,
-          timeoutMs: SUMMARY_TIMEOUT_MS,
-          maxTokens: SUMMARY_MAX_TOKENS,
-        })
+      const raw = await requestQueue(
+        () =>
+          callModel(buildSummaryMessages(text), {
+            baseUrl: model.baseUrl,
+            apiKey: model.apiKey,
+            model: model.model,
+            dialect: model.dialect,
+            /* A summary is not a translation, but the "thinking off" switch is
+             * still the right call: it only asks the model to skip its reasoning
+             * pass, and a summary that spends the budget thinking is no summary. */
+            disableThinking: settings.disableThinking !== false,
+            timeoutMs: SUMMARY_TIMEOUT_MS,
+            maxTokens: SUMMARY_MAX_TOKENS,
+          }),
+        true
       );
       const summary = stripThinkingTags(raw).trim();
       if (!summary) throw new Error('模型没有返回内容');
@@ -1510,7 +1518,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
   if (message.type === 'translate:summarize') {
-    handleSummarize(message).then(sendResponse);
+    handleSummarize(message).then(sendResponse, (error) =>
+      sendResponse({ ok: false, error: String((error && error.message) || error) })
+    );
     return true;
   }
   if (message.type === 'translate:open-options') {
